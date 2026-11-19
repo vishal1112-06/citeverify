@@ -1,9 +1,13 @@
+import time
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-from engine import analyze, read_pdf, second_opinion, agreement, has_key, MAX_CLAIMS
+from engine import (
+    analyze, read_pdf, second_opinion, second_opinion_all, agreement,
+    has_key, MAX_CLAIMS, ERRORS,
+)
 
 st.set_page_config(page_title="CiteVerify", layout="wide")
 
@@ -15,17 +19,38 @@ st.caption(
 
 if not has_key():
     st.error(
-        "GEMINI_API_KEY is missing. Add it to a local .env file, or to the app's "
-        "Secrets on Streamlit Cloud, then reload."
+        "No AI key found. Add GEMINI_API_KEY (and optionally GROQ_API_KEY) to a local .env "
+        "file, or to the app's Secrets on Streamlit Cloud, then reload."
     )
     st.stop()
 
-max_claims = st.sidebar.slider("Max claims to check", 3, 10, MAX_CLAIMS)
-st.sidebar.caption("More claims = slower run and more API usage.")
+DEMO_TEXT = """Modern language models build on a handful of papers.
+The Transformer achieved 28.4 BLEU on the WMT 2014 English-to-German translation task [1].
+The Transformer relies on recurrent and convolutional layers throughout its architecture [1].
+BERT obtained new state-of-the-art results on eleven natural language processing tasks [2].
+BERT improved ImageNet image classification accuracy by 12 percent [2].
+Quantum cabbage networks cut protein folding time by 90 percent [3].
+
+References
+[1] Vaswani, A. et al. (2017). Attention Is All You Need.
+[2] Devlin, J. et al. (2018). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.
+[3] Smith, J. (2031). Quantum Cabbage Networks for Protein Folding.
+"""
 
 REVIEW_OPTIONS = ["Not reviewed", "Accepted", "Rejected", "Needs follow-up"]
 
+# ---------------- sidebar ----------------
+max_claims = st.sidebar.slider("Max claims to check", 3, 10, MAX_CLAIMS)
+st.sidebar.caption("More claims = slower run and more API usage.")
+with st.sidebar.expander("Diagnostics (API errors)"):
+    if ERRORS:
+        for line in ERRORS[-10:]:
+            st.text(line)
+    else:
+        st.write("No API errors so far.")
 
+
+# ---------------- helpers ----------------
 def show_verdict(verdict, reason, confidence, model):
     message = "**%s** (confidence indicator: %s/100, model: %s). %s" % (
         verdict, confidence, model, reason,
@@ -39,7 +64,7 @@ def show_verdict(verdict, reason, confidence, model):
 
 
 def log_review(i):
-    """Called when a reviewer changes the decision or note. Keeps a time-stamped history."""
+    """Runs when a reviewer changes the decision or note. Keeps a time-stamped history."""
     r = st.session_state["results"][i]
     decision = st.session_state.get("rev_dec_%d" % i, "Not reviewed")
     note = st.session_state.get("rev_note_%d" % i, "")
@@ -48,9 +73,15 @@ def log_review(i):
     r["history"].append("%s | %s | %s" % (stamp, decision, note or "-"))
 
 
+def load_demo():
+    st.session_state["pasted_text"] = DEMO_TEXT
+
+
+# ---------------- input ----------------
 tab_text, tab_pdf = st.tabs(["Paste text", "Upload PDF"])
 with tab_text:
-    pasted = st.text_area("Paste text and its reference list", height=260)
+    st.text_area("Paste text and its reference list", height=260, key="pasted_text")
+    st.button("Load demo text", on_click=load_demo)
 with tab_pdf:
     pdf_file = st.file_uploader("Upload a research paper (PDF)", type=["pdf"])
     st.caption("If a PDF is uploaded, it is used first. Remove it to use pasted text.")
@@ -59,36 +90,44 @@ if st.button("Verify citations", type="primary"):
     text = ""
     if pdf_file is not None:
         text = read_pdf(pdf_file)
-    elif pasted.strip():
-        text = pasted
+    elif st.session_state.get("pasted_text", "").strip():
+        text = st.session_state["pasted_text"]
     if not text.strip():
         st.warning("Please paste some text or upload a readable PDF first.")
     else:
         for key in list(st.session_state.keys()):
             if key.startswith("rev_"):
                 del st.session_state[key]
-        bar = st.progress(0.0, text="Starting...")
+        bar = st.progress(0.0, text="Reading the document and finding claims...")
 
-        def show_progress(i, total, claim):
+        def show_progress(done, total, claim):
             bar.progress(
-                i / max(total, 1),
-                text="Checking claim %d of %d..." % (i + 1, total),
+                min(done / max(total, 1), 1.0),
+                text="Checked %d of %d claims..." % (done, total),
             )
 
-        st.session_state["results"] = analyze(text, show_progress, max_claims)
+        started = time.time()
+        try:
+            st.session_state["results"] = analyze(text, show_progress, max_claims)
+            st.session_state["took"] = time.time() - started
+        except Exception as ex:
+            st.session_state["results"] = None
+            st.error("Something went wrong: %s" % str(ex)[:200])
         bar.empty()
 
 results = st.session_state.get("results")
 
+# ---------------- results ----------------
 if results is not None:
     if not results:
-        st.info("No cited claims were found. Try text with citations and a reference list.")
+        st.info(
+            "No cited claims were found. Try text with citations and a reference list, "
+            "or check Diagnostics in the sidebar for API errors."
+        )
     else:
         if st.button("Get a second opinion for all claims"):
-            with st.spinner("Asking the second model..."):
-                for r in results:
-                    if not r.get("second") and r["model"] != "-":
-                        r["second"] = second_opinion(r)
+            with st.spinner("Asking a second AI..."):
+                second_opinion_all(results)
             st.rerun()
 
         rows = []
@@ -107,6 +146,7 @@ if results is not None:
                     "Source": (r["paper"] or {}).get("link", ""),
                     "Model": r["model"],
                     "Second opinion": second["verdict"] if second else "",
+                    "Second model": second["model"] if second else "",
                     "Agreement": agreement(r),
                     "Reviewer decision": review.get("decision", "Not reviewed"),
                     "Reviewer note": review.get("note", ""),
@@ -116,14 +156,19 @@ if results is not None:
         df = pd.DataFrame(rows)
 
         st.subheader("Summary")
-        counts = df["Verdict"].value_counts()
-        st.write(
-            "  |  ".join("%s: %d" % (k, v) for k, v in counts.items())
-        )
         needs = int((df["Verdict"] != "Supported").sum())
-        st.caption("%d of %d claims need attention or human review." % (needs, len(df)))
+        took = st.session_state.get("took")
+        st.write(
+            "**%d of %d claims need attention or human review.**%s"
+            % (needs, len(df), (" Checked in %.0f seconds." % took) if took else "")
+        )
+        st.bar_chart(df["Verdict"].value_counts())
+        only_attention = st.checkbox("Show only claims that need attention")
+        shown = df if not only_attention else df[df["Verdict"] != "Supported"]
         st.dataframe(
-            df[["Claim", "Citation", "Verdict", "Confidence", "Reference check", "Agreement", "Reviewer decision"]]
+            shown[["Claim", "Citation", "Verdict", "Confidence", "Reference check",
+                   "Agreement", "Reviewer decision"]],
+            hide_index=True,
         )
         st.download_button(
             "Download report (CSV)",
@@ -134,6 +179,8 @@ if results is not None:
 
         st.subheader("Details")
         for i, r in enumerate(results):
+            if only_attention and r["verdict"] == "Supported":
+                continue
             with st.expander("Claim %d: %s" % (i + 1, r["claim"][:90]), expanded=(i == 0)):
                 st.write("**Claim:** " + r["claim"])
                 st.write("**Citation:** " + (r["marker"] or "-"))

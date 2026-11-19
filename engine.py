@@ -6,6 +6,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from difflib import SequenceMatcher
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ load_dotenv()
 
 MODEL_A = "gemini-3.5-flash"
 MODEL_B = "gemini-3.5-flash-lite"
+MODEL_GROQ = "llama-3.3-70b-versatile"
 MAX_CLAIMS = 6
 
 VERDICTS = [
@@ -40,44 +42,114 @@ def get_secret(name):
         return None
 
 
-def get_key():
-    return get_secret("GEMINI_API_KEY")
+def get_keys():
+    return [k for k in (get_secret("GEMINI_API_KEY"), get_secret("GEMINI_API_KEY_2")) if k]
 
 
 def has_key():
-    return bool(get_key())
+    return bool(get_keys() or get_secret("GROQ_API_KEY"))
 
 
-_client = None
+_clients = None
 
 
-def get_client():
-    """Create the Gemini client on first use, so a missing key shows a clear message
-    in the app instead of crashing the whole page at import time."""
-    global _client
-    if _client is None:
-        _client = genai.Client(api_key=get_key())
-    return _client
+def get_clients():
+    """Create Gemini clients once for all configured keys."""
+    global _clients
+    if _clients is None:
+        _clients = [genai.Client(api_key=k) for k in get_keys()]
+    return _clients
+
+
+ERRORS = []
+_dead = {}  # (key_id, model) -> time of its last quota (429) error
+
+
+def _log_error(msg):
+    ERRORS.append(msg)
+    del ERRORS[:-20]
+
+
+def _is_dead(pair):
+    """True for 2 minutes after a (key, model) pair returned a quota error."""
+    return time.time() - _dead.get(pair, 0) < 120
+
+
+def _ask_groq(prompt, as_json=False):
+    key = get_secret("GROQ_API_KEY")
+    if not key:
+        return None, None
+    payload = {
+        "model": MODEL_GROQ,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+    }
+    if as_json and "JSON object" in prompt:
+        payload["response_format"] = {"type": "json_object"}
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": "Bearer " + key},
+                json=payload,
+                timeout=20,
+            )
+            if r.status_code == 429:
+                _dead[("groq", MODEL_GROQ)] = time.time()
+                _log_error("groq: 429")
+                return None, None
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
+            return text, MODEL_GROQ
+        except Exception as ex:
+            _log_error("groq: " + str(ex)[:140])
+            time.sleep(1)
+    return None, None
 
 
 def ask_gemini(prompt, models, as_json=False):
-    """Try each model in order. Returns (answer_text, model_used) or (None, None)."""
+    """Try each model/key pair in order (recently rate-limited ones go last).
+    Supports Gemini keys and Groq. Returns (answer_text, model_used) or (None, None)."""
     config = None
     if as_json:
         config = types.GenerateContentConfig(response_mime_type="application/json")
     try:
-        client = get_client()
-    except Exception:
-        return None, None
-    for model in models:
+        clients = get_clients()
+    except Exception as ex:
+        _log_error("client: " + str(ex)[:150])
+        clients = []
+
+    candidates = []
+    for m in models:
+        if m == MODEL_GROQ:
+            if get_secret("GROQ_API_KEY"):
+                candidates.append(("groq", m))
+        else:
+            for idx in range(len(clients)):
+                candidates.append((idx, m))
+
+    for key_id, model in sorted(candidates, key=_is_dead):
+        if key_id == "groq":
+            ans, used = _ask_groq(prompt, as_json=as_json)
+            if ans:
+                return ans, used
+            continue
         for attempt in range(2):
             try:
-                r = client.models.generate_content(
+                r = clients[key_id].models.generate_content(
                     model=model, contents=prompt, config=config
                 )
                 return r.text, model
-            except Exception:
-                time.sleep(2)
+            except Exception as ex:
+                msg = str(ex)
+                _log_error(f"k{key_id + 1}/{model}: " + msg[:140])
+                if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                    _dead[(key_id, model)] = time.time()
+                    break
+                if "503" in msg or "UNAVAILABLE" in msg:
+                    time.sleep(2)
+                else:
+                    break
     return None, None
 
 
@@ -127,7 +199,7 @@ def extract_claims(text, max_claims=MAX_CLAIMS):
         "DOCUMENT BODY:\n" + body + "\n\n"
         "REFERENCE LIST:\n" + (refs or "(none found)")
     )
-    answer, model = ask_gemini(prompt, [MODEL_A, MODEL_B], as_json=True)
+    answer, model = ask_gemini(prompt, [MODEL_A, MODEL_B, MODEL_GROQ], as_json=True)
     data = parse_json(answer)
     if isinstance(data, dict):
         for value in data.values():
@@ -356,7 +428,8 @@ def verify_claim(claim, paper, models):
         "verdict: one of the verdicts above\n"
         "reason: one or two short sentences explaining why\n"
         "evidence: a short quote copied word for word from the abstract, or an empty string\n"
-        "confidence: an integer from 0 to 100 showing how strong the evidence is\n"
+        "confidence: an integer from 0 to 100. Use 90 or more only if the abstract states the claim\n"
+        "almost word for word. Use 60 to 85 for a clear but indirect match, and lower if unsure.\n"
         "If the abstract does not contain enough information, use Needs human review.\n\n"
         "CLAIM: " + claim + "\n\n"
         "PAPER TITLE: " + paper["title"] + "\n"
@@ -388,6 +461,10 @@ def verify_claim(claim, paper, models):
         evidence = ""
         confidence = min(confidence, 50)
         reason += " (The quoted evidence did not match the abstract, so it was removed.)"
+    if not evidence:
+        confidence = min(confidence, 60)
+    if verdict == "Partially supported":
+        confidence = min(confidence, 80)
     return {
         "verdict": verdict,
         "reason": reason,
@@ -404,38 +481,72 @@ def reference_check(c, paper, notes=None):
     if not c.get("reference") and not c.get("title"):
         return "No reference listed for this claim"
     notes = notes or []
-    errors = [n for n in notes if "no result" not in n and "did not match" not in n]
+    misses = [n for n in notes if "no result" in n or "did not match" in n]
+    errors = [n for n in notes if n not in misses]
     why = (" [" + "; ".join(notes) + "]") if notes else ""
+    if len(misses) >= 2:
+        return "Not found online - reference may be wrong (%d services found no match)" % len(misses) + why
     if errors:
         return "Could not check - paper search service error, retry later" + why
     return "Not found online - reference may be wrong" + why
 
 
+def _process(c):
+    notes = []
+    paper = lookup_paper(c["title"], c["reference"], notes)
+    verdict = verify_claim(c["claim"], paper, [MODEL_A, MODEL_B, MODEL_GROQ])
+    item = dict(c)
+    item.update(verdict)
+    item["paper"] = paper
+    item["ref_check"] = reference_check(c, paper, notes)
+    item["second"] = None
+    item["review"] = None
+    item["history"] = []
+    return item
+
+
 def analyze(text, progress=None, max_claims=MAX_CLAIMS):
-    """Full pipeline: claims, paper lookup, verdicts. Returns a list of dicts."""
+    """Full pipeline, claims checked 3 at a time. Returns a list of dicts."""
     claims = extract_claims(text, max_claims)
-    results = []
-    for i, c in enumerate(claims):
-        if progress:
-            progress(i, len(claims), c["claim"])
-        notes = []
-        paper = lookup_paper(c["title"], c["reference"], notes)
-        verdict = verify_claim(c["claim"], paper, [MODEL_A, MODEL_B])
-        item = dict(c)
-        item.update(verdict)
-        item["paper"] = paper
-        item["ref_check"] = reference_check(c, paper, notes)
-        item["second"] = None
-        item["review"] = None
-        item["history"] = []
-        results.append(item)
+    if not claims:
+        return []
+    try:
+        get_clients()
+    except Exception:
+        pass
+    results = [None] * len(claims)
+    done = 0
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_process, c): i for i, c in enumerate(claims)}
+        for f in as_completed(futures):
+            results[futures[f]] = f.result()
+            done += 1
+            if progress:
+                progress(done, len(claims), "")
     return results
 
 
 def second_opinion(item):
-    """Re-check one claim with the OTHER model, so the two opinions are independent."""
-    other = MODEL_B if item.get("model") == MODEL_A else MODEL_A
-    return verify_claim(item["claim"], item.get("paper"), [other])
+    """Re-check with an independent vendor (Groq) first, then the other Gemini model."""
+    primary = item.get("model")
+    other_gemini = MODEL_B if primary == MODEL_A else MODEL_A
+    if primary == MODEL_GROQ:
+        models = [MODEL_A, MODEL_B, MODEL_GROQ]
+    else:
+        models = [MODEL_GROQ, other_gemini]
+        if primary in (MODEL_A, MODEL_B):
+            models.append(primary)
+    return verify_claim(item["claim"], item.get("paper"), models)
+
+
+def second_opinion_all(items):
+    todo = [r for r in items if not r.get("second") and r["model"] != "-"]
+    if not todo:
+        return
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        outs = list(pool.map(second_opinion, todo))
+    for r, o in zip(todo, outs):
+        r["second"] = o
 
 
 def agreement(item):
@@ -444,6 +555,7 @@ def agreement(item):
         return ""
     if second["model"] in ("-", None):
         return "No second opinion available"
+    same = " (same model, not independent)" if second["model"] == item.get("model") else ""
     if second["verdict"] == item["verdict"]:
-        return "Agree"
-    return "Disagree - needs human review"
+        return "Agree" + same
+    return "Disagree - needs human review" + same

@@ -1,3 +1,4 @@
+import html
 import time
 from datetime import datetime
 
@@ -9,13 +10,59 @@ from engine import (
     has_key, MAX_CLAIMS, ERRORS,
 )
 
-st.set_page_config(page_title="CiteVerify", layout="wide")
+st.set_page_config(page_title="CiteVerify", page_icon="🔎", layout="wide")
 
-st.title("CiteVerify")
-st.caption(
-    "Checks whether cited papers really support the claims made in a document. "
-    "Results are indicators for human review, not final judgments."
+VERDICT_STYLE = {
+    "Supported": ("#16a34a", "#dcfce7", "✅"),
+    "Partially supported": ("#d97706", "#fef3c7", "🟡"),
+    "Unsupported": ("#dc2626", "#fee2e2", "❌"),
+    "Contradictory": ("#b91c1c", "#fee2e2", "⛔"),
+    "Needs human review": ("#475569", "#e2e8f0", "👀"),
+}
+VERDICT_ORDER = ["Supported", "Partially supported", "Unsupported",
+                 "Contradictory", "Needs human review"]
+
+st.markdown(
+    """
+<style>
+.block-container {padding-top: 1.6rem; max-width: 1200px;}
+.cv-hero {background: linear-gradient(120deg,#0f172a 0%,#1e3a8a 60%,#2563eb 100%);
+  border-radius: 16px; padding: 28px 32px; color: #fff; margin-bottom: 18px;}
+.cv-hero h1 {color:#fff; margin:0; font-size: 2.2rem;}
+.cv-hero p {color:#dbeafe; margin:6px 0 0 0; font-size: 1.02rem;}
+.cv-pills {margin-top: 14px;}
+.cv-pill {display:inline-block; background:rgba(255,255,255,.14); color:#fff;
+  border-radius: 999px; padding: 4px 12px; margin: 0 8px 6px 0; font-size: .82rem;}
+.cv-badge {display:inline-block; border-radius: 999px; padding: 3px 12px;
+  font-weight: 600; font-size: .85rem;}
+.cv-card {border-radius: 12px; padding: 14px 16px; border: 1px solid #e2e8f0;
+  background: #ffffff; margin-bottom: 8px; color: #0f172a;}
+.cv-card .lbl {font-size:.78rem; color:#64748b; text-transform: uppercase; letter-spacing:.04em;}
+.cv-card .val {font-size:1.7rem; font-weight:700; line-height:1.2;}
+.cv-box {border-left: 5px solid #94a3b8; background:#f8fafc; border-radius: 8px;
+  padding: 10px 14px; margin: 8px 0; color:#0f172a;}
+div.stButton > button[kind="primary"] {border-radius: 10px; padding: .55rem 1.4rem; font-weight:600;}
+</style>
+""",
+    unsafe_allow_html=True,
 )
+
+st.markdown(
+    """
+<div class="cv-hero">
+  <h1>🔎 CiteVerify</h1>
+  <p>Does the cited paper really say that? Check every claim against its reference, in seconds.</p>
+  <div class="cv-pills">
+    <span class="cv-pill">Finds fake or wrong references</span>
+    <span class="cv-pill">Quote-checked evidence</span>
+    <span class="cv-pill">Two independent AI models</span>
+    <span class="cv-pill">Human review with audit trail</span>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+st.caption("Results are indicators to support human review, not final judgments.")
 
 if not has_key():
     st.error(
@@ -51,16 +98,23 @@ with st.sidebar.expander("Diagnostics (API errors)"):
 
 
 # ---------------- helpers ----------------
-def show_verdict(verdict, reason, confidence, model):
-    message = "**%s** (confidence indicator: %s/100, model: %s). %s" % (
-        verdict, confidence, model, reason,
+def badge(verdict):
+    color, bg, icon = VERDICT_STYLE.get(verdict, ("#475569", "#e2e8f0", "•"))
+    return (
+        '<span class="cv-badge" style="color:%s;background:%s">%s %s</span>'
+        % (color, bg, icon, html.escape(str(verdict)))
     )
-    if verdict == "Supported":
-        st.success(message)
-    elif verdict in ("Unsupported", "Contradictory"):
-        st.error(message)
-    else:
-        st.warning(message)
+
+
+def show_verdict(verdict, reason, confidence, model):
+    color = VERDICT_STYLE.get(verdict, ("#475569", "#e2e8f0", "•"))[0]
+    st.markdown(
+        '<div class="cv-box" style="border-left-color:%s">%s &nbsp; '
+        '<b>%s/100</b> confidence indicator &middot; model: %s<br>%s</div>'
+        % (color, badge(verdict), html.escape(str(confidence)),
+           html.escape(str(model)), html.escape(str(reason))),
+        unsafe_allow_html=True,
+    )
 
 
 def log_review(i):
@@ -158,17 +212,64 @@ if results is not None:
         st.subheader("Summary")
         needs = int((df["Verdict"] != "Supported").sum())
         took = st.session_state.get("took")
-        st.write(
-            "**%d of %d claims need attention or human review.**%s"
-            % (needs, len(df), (" Checked in %.0f seconds." % took) if took else "")
+        n_ok = len(df) - needs
+        n_fake = int(df["Reference check"].astype(str).str.startswith("Not found").sum())
+        cards = [
+            ("Claims checked", str(len(df)), "#0f172a"),
+            ("Supported", str(n_ok), "#16a34a"),
+            ("Need attention", str(needs), "#dc2626" if needs else "#16a34a"),
+            ("References not found", str(n_fake), "#d97706" if n_fake else "#16a34a"),
+            ("Time", ("%.0fs" % took) if took else "-", "#2563eb"),
+        ]
+        for col, (lbl, val, color) in zip(st.columns(len(cards)), cards):
+            col.markdown(
+                '<div class="cv-card"><div class="lbl">%s</div>'
+                '<div class="val" style="color:%s">%s</div></div>' % (lbl, color, val),
+                unsafe_allow_html=True,
+            )
+
+        counts = df["Verdict"].value_counts()
+        chart_df = pd.DataFrame(
+            {"Verdict": [v for v in VERDICT_ORDER if v in counts.index],
+             "Claims": [int(counts[v]) for v in VERDICT_ORDER if v in counts.index]}
         )
-        st.bar_chart(df["Verdict"].value_counts())
+        try:
+            import altair as alt
+            domain = list(chart_df["Verdict"])
+            rng = [VERDICT_STYLE[v][0] for v in domain]
+            chart = (
+                alt.Chart(chart_df)
+                .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+                .encode(
+                    x=alt.X("Verdict:N", sort=domain, title=None,
+                            axis=alt.Axis(labelAngle=0, labelLimit=140)),
+                    y=alt.Y("Claims:Q", title=None, axis=alt.Axis(tickMinStep=1)),
+                    color=alt.Color("Verdict:N", scale=alt.Scale(domain=domain, range=rng),
+                                    legend=None),
+                    tooltip=["Verdict", "Claims"],
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(chart, use_container_width=True)
+        except Exception:
+            st.bar_chart(chart_df.set_index("Verdict"))
+
         only_attention = st.checkbox("Show only claims that need attention")
         shown = df if not only_attention else df[df["Verdict"] != "Supported"]
+        table = shown[["Claim", "Citation", "Verdict", "Confidence", "Reference check",
+                       "Agreement", "Reviewer decision"]].copy()
+        table["Verdict"] = table["Verdict"].apply(
+            lambda v: "%s %s" % (VERDICT_STYLE.get(v, ("", "", "•"))[2], v)
+        )
         st.dataframe(
-            shown[["Claim", "Citation", "Verdict", "Confidence", "Reference check",
-                   "Agreement", "Reviewer decision"]],
+            table,
             hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Claim": st.column_config.TextColumn(width="large"),
+                "Confidence": st.column_config.ProgressColumn(
+                    "Confidence", min_value=0, max_value=100, format="%d"),
+            },
         )
         st.download_button(
             "Download report (CSV)",
@@ -181,7 +282,7 @@ if results is not None:
         for i, r in enumerate(results):
             if only_attention and r["verdict"] == "Supported":
                 continue
-            with st.expander("Claim %d: %s" % (i + 1, r["claim"][:90]), expanded=(i == 0)):
+            with st.expander("%s Claim %d: %s" % (VERDICT_STYLE.get(r["verdict"], ("", "", "•"))[2], i + 1, r["claim"][:90]), expanded=(i == 0)):
                 st.write("**Claim:** " + r["claim"])
                 st.write("**Citation:** " + (r["marker"] or "-"))
                 st.write("**Reference check:** " + r.get("ref_check", "-"))

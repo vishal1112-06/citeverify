@@ -1,0 +1,11 @@
+Modern language models build on a handful of papers.
+The Transformer achieved 28.4 BLEU on the WMT 2014 English-to-German translation task [1].
+The Transformer relies on recurrent and convolutional layers throughout its architecture [1].
+BERT obtained new state-of-the-art results on eleven natural language processing tasks [2].
+BERT improved ImageNet image classification accuracy by 12 percent [2].
+Quantum cabbage networks cut protein folding time by 90 percent [3].
+
+References
+[1] Vaswani, A. et al. (2017). Attention Is All You Need.
+[2] Devlin, J. et al. (2018). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.
+[3] Smith, J. (2031). Quantum Cabbage Networks for Protein Folding.

@@ -33,7 +33,11 @@ Paste text with its reference list, or upload a PDF. For every cited claim, Cite
 
 ## Demo (30 seconds)
 
-Open the live app, click **Load demo text**, set "Max claims to check" to 5 or more, then click **Verify citations**.
+Open the live app, click **Load demo text**, set "Max claims to check" to 5 or more, then click **Verify citations**.### Real output from the live app
+![Summary and table](results.png)
+![Claim details with evidence](details.png)
+
+Full output of this demo run: [sample_report.csv](sample_report.csv)
 
 | Claim in the demo text | Result |
 |---|---|

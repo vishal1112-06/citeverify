@@ -163,14 +163,93 @@ def read_pdf(file):
 
 
 def split_text(text, max_body=35000, max_refs=15000):
-    matches = list(re.finditer(r"(?im)^\s*(references|bibliography|works cited)\s*$", text or ""))
+    """Split the paper body from common reference-list headings."""
+    text = text or ""
+    heading = re.compile(
+        r"(?im)^[ \t]*(references|bibliography|works\s+cited)"
+        r"(?:[ \t]*[:\-]?[ \t]*(?:\([^)]+\))?)?[ \t]*$"
+    )
+    matches = list(heading.finditer(text))
     if matches:
         pos = matches[-1].start()
         return text[:pos][:max_body], text[pos:][:max_refs]
-    return (text or "")[:max_body], ""
+    return text[:max_body], ""
 
 
+def _parse_numbered_references(refs):
+    """Read numbered reference entries, joining wrapped continuation lines."""
+    entries = {}
+    current_number = None
+    current_text = []
+    for raw_line in (refs or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^\[(\d{1,3})\]\s*(.+)$", line)
+        if not match:
+            match = re.match(r"^(\d{1,3})[.)]\s+(.+)$", line)
+        if match:
+            if current_number is not None:
+                entries[current_number] = " ".join(current_text).strip()
+            current_number = int(match.group(1))
+            current_text = [match.group(2).strip()]
+        elif current_number is not None:
+            current_text.append(line)
+    if current_number is not None:
+        entries[current_number] = " ".join(current_text).strip()
+    return entries
+
+
+def _rule_based_claims(text, max_claims=MAX_CLAIMS):
+    """
+    Deterministic fallback for numeric citations, e.g. [1], [2, 3], [4-6].
+    It does not guess references or assess whether a claim is supported.
+    """
+    body, refs = split_text(text)
+    reference_map = _parse_numbered_references(refs)
+    if not body.strip():
+        return []
+
+    citation_re = re.compile(r"\[(\d+(?:\s*[,;–-]\s*\d+)*)\]")
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(\[\"'])", body)
+    output, seen = [], set()
+
+    for sentence in sentences:
+        sentence = re.sub(r"\s+", " ", sentence).strip()
+        for match in citation_re.finditer(sentence):
+            numbers = []
+            for token in re.split(r"[,;]", match.group(1)):
+                token = token.strip()
+                range_match = re.fullmatch(r"(\d+)\s*[–-]\s*(\d+)", token)
+                if range_match:
+                    first, last = map(int, range_match.groups())
+                    if first <= last and last - first <= 10:
+                        numbers.extend(range(first, last + 1))
+                elif token.isdigit():
+                    numbers.append(int(token))
+
+            for number in dict.fromkeys(numbers):
+                signature = (sentence.lower(), number)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                output.append({
+                    "claim": sentence,
+                    "marker": "[%d]" % number,
+                    "reference": reference_map.get(number, ""),
+                    "title": ""
+                })
+                if len(output) >= max(1, min(int(max_claims), MAX_CLAIMS)):
+                    return output
+    return output
 def extract_claims(text, max_claims=MAX_CLAIMS):
+    # Prefer deterministic extraction for numbered citations. It remains
+    # available when Gemini/Groq are down and makes numeric benchmarks repeatable.
+    rule_based = _rule_based_claims(text, max_claims=max_claims)
+    if rule_based:
+        return rule_based
+
+    # AI extraction remains the fallback for author-year and other citation styles.
     body, refs = split_text(text)
     prompt = (
         "Extract up to %d important factual claims that have in-text citations. "

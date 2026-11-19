@@ -151,7 +151,19 @@ if st.button("Verify citations", type="primary"):
 results = st.session_state.results
 if results is not None:
     if not results:
-        st.info("No cited claims extracted. Check the in-text citations, reference heading, and API diagnostics.")
+        st.error("No cited claims were extracted.")
+        st.caption("Possible causes: the PDF has no extractable text, its citation style is unsupported, or AI extraction failed.")
+        with st.expander("Debug extracted text"):
+            st.write("Extracted characters:", len(text) if "text" in locals() else "Unavailable")
+            if "text" in locals() and text:
+                preview = text[:5000]
+                st.text(preview + ("\\n\\n[Preview truncated]" if len(text) > 5000 else ""))
+            st.write("Recent API diagnostics:")
+            if ERRORS:
+                for error in ERRORS[-8:]:
+                    st.code(error)
+            else:
+                st.write("No API errors were recorded.")
     else:
         if st.button("Get second opinions for all eligible claims"):
             with st.spinner("Requesting second opinions..."):

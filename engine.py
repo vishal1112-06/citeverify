@@ -18,7 +18,7 @@ load_dotenv()
 
 MODEL_A = "gemini-3.5-flash"
 MODEL_B = "gemini-3.5-flash-lite"
-MODEL_GROQ = "llama-3.3-70b-versatile"
+MODEL_GROQ = "openai/gpt-oss-120b"
 MAX_CLAIMS = 6
 
 VERDICTS = [
